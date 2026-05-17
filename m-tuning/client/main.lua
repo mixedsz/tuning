@@ -1,6 +1,5 @@
 -- ==========================================
 -- m-tuning | client/main.lua
--- Client-side core: commands, NUI callbacks, vehicle monitoring
 -- ==========================================
 
 Core           = nil
@@ -8,6 +7,11 @@ createCallback = nil
 local currentVeh  = nil
 local isDriftMode = false
 local isSportMode = false
+
+-- Factory (unmodified) handling values cached the moment we enter a vehicle,
+-- before applyVehicleData runs. Every mode / save calculation is based on
+-- these values so nothing can ever compound or stack.
+local vehicleFactory = {}   -- [veh entity] = flat handling table
 
 -- ==========================================
 -- Framework initialisation
@@ -31,22 +35,37 @@ local function IsInVehicle()
     return veh ~= 0 and DoesEntityExist(veh), veh
 end
 
+-- Returns the factory handling table for the current vehicle.
+-- If we somehow don't have it cached yet, read live (safe fallback).
+local function GetFactory()
+    if currentVeh and vehicleFactory[currentVeh] then
+        return vehicleFactory[currentVeh]
+    end
+    if currentVeh and DoesEntityExist(currentVeh) then
+        return GetVehData(currentVeh)
+    end
+    return {}
+end
+
+-- Shallow-copy a table so we can modify it without touching the original
+local function ShallowCopy(t)
+    local out = {}
+    for k, v in pairs(t) do out[k] = v end
+    return out
+end
+
 -- Send the current vehicle's handling snapshot to the NUI
 local function SendVehicleDataToNUI()
     if not currentVeh or not DoesEntityExist(currentVeh) then return end
-    local vehData = GetVehData(currentVeh)
-    SendNUIMessage({ message = 'GET_VEHICLE_DATA', vehicleData = vehData })
+    SendNUIMessage({ message = 'GET_VEHICLE_DATA', vehicleData = GetVehData(currentVeh) })
 end
 
--- Fetch presets from server and forward to NUI
+-- Fetch custom presets from server and push to NUI
 local function SendPresetsToNUI()
     if not currentVeh or not DoesEntityExist(currentVeh) then return end
     local plate = GetVehicleNumberPlateText(currentVeh)
     createCallback('m-tuning:getPresets', function(presets)
-        SendNUIMessage({
-            message       = 'GET_CURRENT_DATA',
-            GetCurrentData = presets or {}
-        })
+        SendNUIMessage({ message = 'GET_CURRENT_DATA', GetCurrentData = presets or {} })
     end, plate)
 end
 
@@ -122,35 +141,20 @@ local function GenerateHandlingXML(d)
 end
 
 -- ==========================================
--- Open tablet (tuning)
+-- Open tuning tablet
 -- ==========================================
 local function OpenTablet()
     while not createCallback do Wait(100) end
-
     local inVeh, veh = IsInVehicle()
-    if not inVeh then
-        ClientNotification(Locales.Default['ARE_NOT_VEHICLE'], 'error')
-        return
-    end
+    if not inVeh then ClientNotification(Locales.Default['ARE_NOT_VEHICLE'], 'error') return end
 
     local function DoOpen()
         currentVeh = veh
         local vehName = GetDisplayNameFromVehicleModel(GetEntityModel(veh))
-
-        -- Fetch group/auth and open NUI
         createCallback('m-tuning:getGroup', function(group, authActive)
-            SendNUIMessage({
-                message    = 'GET_GROUP',
-                Auth       = group,
-                AuthActive = authActive
-            })
+            SendNUIMessage({ message = 'GET_GROUP', Auth = group, AuthActive = authActive })
         end)
-
-        SendNUIMessage({
-            message = 'OPEN_TABLET',
-            vehName = vehName,
-            Locales = Locales.Default
-        })
+        SendNUIMessage({ message = 'OPEN_TABLET', vehName = vehName, Locales = Locales.Default })
         SetNuiFocus(true, true)
         isDriftMode = false
         isSportMode = false
@@ -158,10 +162,7 @@ local function OpenTablet()
 
     if Config.ItemControl then
         createCallback('m-tuning:hasItem', function(hasItem)
-            if not hasItem then
-                ClientNotification(Locales.Default['NO_HAVE_TABLET'], 'error')
-                return
-            end
+            if not hasItem then ClientNotification(Locales.Default['NO_HAVE_TABLET'], 'error') return end
             DoOpen()
         end)
     else
@@ -170,38 +171,25 @@ local function OpenTablet()
 end
 
 -- ==========================================
--- Open checker tablet (police)
+-- Open police checker tablet
 -- ==========================================
 local function OpenTunerChecker()
     while not createCallback do Wait(100) end
-
     local inVeh, veh = IsInVehicle()
-    if not inVeh then
-        ClientNotification(Locales.Default['ARE_NOT_VEHICLE'], 'error')
-        return
-    end
+    if not inVeh then ClientNotification(Locales.Default['ARE_NOT_VEHICLE'], 'error') return end
 
     createCallback('m-tuning:checkJob', function(authorized)
-        if not authorized then
-            ClientNotification(Locales.Default['ARE_NOT_POLICE'], 'error')
-            return
-        end
+        if not authorized then ClientNotification(Locales.Default['ARE_NOT_POLICE'], 'error') return end
 
         local function DoOpenChecker()
             currentVeh = veh
-            SendNUIMessage({
-                message = 'OPEN_POLICE_TABLET',
-                Locales = Locales.Default
-            })
+            SendNUIMessage({ message = 'OPEN_POLICE_TABLET', Locales = Locales.Default })
             SetNuiFocus(true, true)
         end
 
         if Config.ItemControl then
             createCallback('m-tuning:hasCheckerItem', function(hasItem)
-                if not hasItem then
-                    ClientNotification(Locales.Default['NO_HAVE_TABLET'], 'error')
-                    return
-                end
+                if not hasItem then ClientNotification(Locales.Default['NO_HAVE_TABLET'], 'error') return end
                 DoOpenChecker()
             end)
         else
@@ -213,13 +201,8 @@ end
 -- ==========================================
 -- Commands
 -- ==========================================
-RegisterCommand(Config.OpenCommand, function()
-    OpenTablet()
-end, false)
-
-RegisterCommand(Config.TunerChecker, function()
-    OpenTunerChecker()
-end, false)
+RegisterCommand(Config.OpenCommand,  function() OpenTablet()      end, false)
+RegisterCommand(Config.TunerChecker, function() OpenTunerChecker() end, false)
 
 -- ==========================================
 -- NUI Callbacks
@@ -232,18 +215,44 @@ RegisterNUICallback('CLOSE_TABLET', function(_, cb)
     cb('ok')
 end)
 
--- Basic tuning page sliders: boost, acceleration, gear change, brake bias, drivetrain.
--- Also scales top speed proportionally with the boost value so the car actually goes
--- faster and doesn't just hit the same stock speed cap.
+-- -------------------------------------------------------
+-- SAVE_DATA  (basic tuning page — 5 sliders)
+-- All calculations are based on vehicleFactory so they
+-- never compound no matter how many times the user saves.
+-- -------------------------------------------------------
 RegisterNUICallback('SAVE_DATA', function(data, cb)
     if not currentVeh or not DoesEntityExist(currentVeh) then cb('ok') return end
-    setVehData(currentVeh, data)
 
-    -- Scale top speed with boost (boost 0→0.5 maps to 1.0→2.5× top speed)
-    local boostVal   = tonumber(data.boost) or 0.0
-    local stockSpeed = GetVehicleHandlingFloat(currentVeh, 'CHandlingData', 'fInitialDriveMaxFlatVel')
-    local speedMult  = 1.0 + (boostVal / 0.5) * 1.5   -- 0 boost = stock, 0.5 boost = 2.5×
-    SetVehicleHandlingFloat(currentVeh, 'CHandlingData', 'fInitialDriveMaxFlatVel', stockSpeed * speedMult)
+    local f          = GetFactory()
+    local boostVal   = tonumber(data.boost)        or 0.0
+    local accelVal   = tonumber(data.acceleration) or (tonumber(f.driveInertiaValue) or 0.5)
+    local gearVal    = tonumber(data.gearchange)   or (tonumber(f.shiftUpValue)      or 1.0)
+    local brakeVal   = tonumber(data.breaking)     or (tonumber(f.brakeBiasValue)    or 0.5)
+    local driveVal   = tonumber(data.drivetrain)   or (tonumber(f.powerBiasValue)    or 0.5)
+
+    local stockPower = tonumber(f.powerValue)    or 0.28
+    local stockSpeed = tonumber(f.topSpeedValue) or 1.4
+
+    -- Map boost slider 0→0.5 to engine force 1×→6× factory value.
+    -- At max boost a stock car (0.28) becomes 1.68 — very noticeably fast.
+    local newPower    = stockPower * (1.0 + (boostVal / 0.5) * 5.0)
+    -- Top speed scales 1×→3× factory. Always from factory, never compounds.
+    local newTopSpeed = stockSpeed * (1.0 + (boostVal / 0.5) * 2.0)
+
+    SetVehicleHandlingFloat(currentVeh, 'CHandlingData', 'fInitialDriveForce',              newPower)
+    SetVehicleHandlingFloat(currentVeh, 'CHandlingData', 'fInitialDriveMaxFlatVel',         newTopSpeed)
+    SetVehicleHandlingFloat(currentVeh, 'CHandlingData', 'fDriveInertia',                   accelVal)
+    SetVehicleHandlingFloat(currentVeh, 'CHandlingData', 'fClutchChangeRateScaleUpShift',   gearVal)
+    SetVehicleHandlingFloat(currentVeh, 'CHandlingData', 'fClutchChangeRateScaleDownShift', gearVal)
+    SetVehicleHandlingFloat(currentVeh, 'CHandlingData', 'fBrakeBiasFront',                 brakeVal)
+    SetVehicleHandlingFloat(currentVeh, 'CHandlingData', 'fDriveBiasFront',                 driveVal)
+
+    -- Also boost traction so the extra power doesn't just spin the wheels
+    local stockGripMax = tonumber(f.tireGripMaxValue) or 2.5
+    local stockGripMin = tonumber(f.tireGripMinValue) or 2.0
+    local gripScale    = 1.0 + (boostVal / 0.5) * 0.5  -- up to 1.5× grip at max boost
+    SetVehicleHandlingFloat(currentVeh, 'CHandlingData', 'fTractionCurveMax', stockGripMax * gripScale)
+    SetVehicleHandlingFloat(currentVeh, 'CHandlingData', 'fTractionCurveMin', stockGripMin * gripScale)
 
     local plate    = GetVehicleNumberPlateText(currentVeh)
     local snapshot = GetVehData(currentVeh)
@@ -259,68 +268,82 @@ RegisterNUICallback('GET_ADVANCED_DATA', function(_, cb)
     cb('ok')
 end)
 
--- Save a named advanced preset (also applies it immediately)
+-- Save a named advanced preset and apply it to the vehicle immediately
 RegisterNUICallback('SAVE_ADVANCED_DATA', function(data, cb)
     if not currentVeh or not DoesEntityExist(currentVeh) then cb('ok') return end
     if not data.vehicleData or not data.DataName or data.DataName == '' then cb('ok') return end
 
     local plate = GetVehicleNumberPlateText(currentVeh)
-    -- Save flat vehicleData to preset DB row (InsertXML will re-wrap when applying)
     TriggerServerEvent('m-tuning:savePreset', plate, data.vehicleData, data.DataName)
-    -- setAdvancedData expects { vehicleData = {flat handling} } as its data arg
     setAdvancedData(currentVeh, { vehicleData = data.vehicleData }, false, false)
     ClientNotification(Locales.Default['ADVANCED_MODE_NOTIFY'], 'success')
     cb('ok')
 end)
 
--- Fetch presets and push them to the NUI
 RegisterNUICallback('GET_CUSTOMS_DATA', function(_, cb)
     if not currentVeh or not DoesEntityExist(currentVeh) then cb('ok') return end
     SendPresetsToNUI()
     cb('ok')
 end)
 
--- Delete a preset by name, then refresh the presets list
 RegisterNUICallback('DELETE_PRESET', function(data, cb)
     if not currentVeh or not DoesEntityExist(currentVeh) then cb('ok') return end
     if not data.vehicleData or not data.vehicleData.name then cb('ok') return end
-
-    local plate = GetVehicleNumberPlateText(currentVeh)
-    TriggerServerEvent('m-tuning:deletePreset', plate, data.vehicleData.name)
+    TriggerServerEvent('m-tuning:deletePreset', GetVehicleNumberPlateText(currentVeh), data.vehicleData.name)
     ClientNotification(Locales.Default['DELETE_PRESET'], 'success')
     cb('ok')
 end)
 
--- Reset vehicle handling to saved default (or factory if no DB record)
+-- Reset handling to the cached factory values for this vehicle
 RegisterNUICallback('DEFAULT_BACK', function(_, cb)
     if not currentVeh or not DoesEntityExist(currentVeh) then cb('ok') return end
     local plate = GetVehicleNumberPlateText(currentVeh)
-    DefaultAdvancedData(currentVeh, plate, nil)
+    local f     = GetFactory()
+    setAdvancedData(currentVeh, { vehicleData = f }, false, false)
+    TriggerServerEvent('m-tuning:CreateTableData', plate, { vehicleData = f }, 'CurrentVehicleData')
     isDriftMode = false
     isSportMode = false
     ClientNotification(Locales.Default['DEFAULT_BACKE'], 'success')
     cb('ok')
 end)
 
--- Change driving mode: driftMode | sportMode | normalMode
+-- -------------------------------------------------------
+-- CHANGE_MODE  (preset page built-in modes)
+-- HTML sends 'DriftMode' / 'SportMode' / 'NormalMode'
+-- All calculations are based on vehicleFactory — no stacking.
+-- -------------------------------------------------------
 RegisterNUICallback('CHANGE_MODE', function(data, cb)
     if not currentVeh or not DoesEntityExist(currentVeh) then cb('ok') return end
-    local mode = data.mode
 
-    -- Normalise mode string — HTML sends 'DriftMode'/'SportMode'/'NormalMode'
-    local modeLower = string.lower(mode)
+    local modeLower = string.lower(data.mode or '')
+    local f         = GetFactory()
+    local plate     = GetVehicleNumberPlateText(currentVeh)
+
+    local stockPower    = tonumber(f.powerValue)           or 0.28
+    local stockSpeed    = tonumber(f.topSpeedValue)        or 1.4
+    local stockInertia  = tonumber(f.driveInertiaValue)    or 0.5
+    local stockShiftUp  = tonumber(f.shiftUpValue)         or 1.0
+    local stockShiftDn  = tonumber(f.shiftDownValue)       or 1.0
+    local stockGripMax  = tonumber(f.tireGripMaxValue)     or 2.5
+    local stockGripMin  = tonumber(f.tireGripMinValue)     or 2.0
+    local stockOffRoad  = tonumber(f.offRoadTractionValue) or 1.0
+    local stockHBrake   = tonumber(f.handBrakeStrength)    or 0.5
 
     if modeLower == 'driftmode' then
         isDriftMode = true
         isSportMode = false
 
-        local d = GetVehData(currentVeh)
-        d.powerBiasValue       = 0.01                        -- pure RWD
-        d.tireGripMaxValue     = d.tireGripMaxValue     * 0.65
-        d.tireGripMinValue     = d.tireGripMinValue     * 0.65
-        d.offRoadTractionValue = d.offRoadTractionValue * 1.5
-        d.lowSpeedBurnoutValue = 1.5
-        d.handBrakeStrength    = d.handBrakeStrength    * 1.5
+        local d = ShallowCopy(f)
+        d.powerValue           = stockPower * 1.8   -- enough grunt to drift
+        d.topSpeedValue        = stockSpeed * 2.2   -- faster than stock but not stupid
+        d.powerBiasValue       = 0.01               -- pure RWD
+        d.tireGripMaxValue     = stockGripMax * 0.50  -- slide easily
+        d.tireGripMinValue     = stockGripMin * 0.50
+        d.offRoadTractionValue = stockOffRoad * 2.0
+        d.lowSpeedBurnoutValue = 2.5
+        d.handBrakeStrength    = stockHBrake  * 2.5
+        d.shiftUpValue         = math.min(stockShiftUp * 3.0, 10.0)
+        d.shiftDownValue       = math.min(stockShiftDn * 3.0, 10.0)
         setAdvancedData(currentVeh, { vehicleData = d }, false, false)
         ClientNotification(Locales.Default['DRIFT_MODE_NOTIFY'], 'success')
 
@@ -328,22 +351,26 @@ RegisterNUICallback('CHANGE_MODE', function(data, cb)
         isDriftMode = false
         isSportMode = true
 
-        local d = GetVehData(currentVeh)
-        -- Multiply raw drive force by the power multiplier factor
-        d.powerValue        = d.powerValue * (Config.SportModeSettings['PowerMultiplier'] / 10.0)
-        d.topSpeedValue     = d.topSpeedValue + Config.SportModeSettings['fInitialDriveMaxFlatVel']
-        d.driveInertiaValue = Config.SportModeSettings['fDriveInertia']
-        d.shiftUpValue      = Config.SportModeSettings['fClutchChangeRateScaleUpShift']
-        d.shiftDownValue    = Config.SportModeSettings['fClutchChangeRateScaleDownShift']
+        local d = ShallowCopy(f)
+        d.powerValue        = stockPower * 4.0          -- 4× factory power
+        d.topSpeedValue     = stockSpeed * 3.5          -- 3.5× factory top speed
+        d.driveInertiaValue = math.min(stockInertia * 2.0, 3.0)
+        d.shiftUpValue      = math.min(stockShiftUp * 5.0, 10.0)
+        d.shiftDownValue    = math.min(stockShiftDn * 5.0, 10.0)
+        d.tireGripMaxValue  = math.min(stockGripMax * 1.5, 10.0)  -- more grip to use the power
+        d.tireGripMinValue  = math.min(stockGripMin * 1.5, 10.0)
         setAdvancedData(currentVeh, { vehicleData = d }, false, false)
-        SetVehicleEnginePowerMultiplier(currentVeh, Config.SportModeSettings['PowerMultiplier'])
+        -- Engine multipliers stack on top of the handling floats for instant feel
+        SetVehicleEnginePowerMultiplier(currentVeh,  Config.SportModeSettings['PowerMultiplier'])
         SetVehicleEngineTorqueMultiplier(currentVeh, Config.SportModeSettings['TorqueMultiplier'])
         ClientNotification(Locales.Default['SPORT_MODE_NOTIFY'], 'success')
 
     elseif modeLower == 'normalmode' then
         isDriftMode = false
         isSportMode = false
-        DefaultAdvancedData(currentVeh, GetVehicleNumberPlateText(currentVeh), nil)
+        -- Restore exact factory values — no DB lookup needed
+        setAdvancedData(currentVeh, { vehicleData = f }, false, false)
+        TriggerServerEvent('m-tuning:CreateTableData', plate, { vehicleData = f }, 'CurrentVehicleData')
         ClientNotification(Locales.Default['NORMAL_MODE_NOTIFY'], 'success')
     end
 
@@ -351,67 +378,59 @@ RegisterNUICallback('CHANGE_MODE', function(data, cb)
     cb('ok')
 end)
 
--- Police checker: ask server if this vehicle has tuning data
+-- Police checker: ask server if vehicle has saved tuning data
 RegisterNUICallback('GET_VEHICLE_STATUS', function(_, cb)
     if not currentVeh or not DoesEntityExist(currentVeh) then cb('ok') return end
-    local plate = GetVehicleNumberPlateText(currentVeh)
     createCallback('m-tuning:getVehicleStatus', function(isTuned)
         SendNUIMessage({
             message           = 'SET_VEHICLE_STATUS',
             vehiclestatusPage = isTuned and 'tunedVehicle' or 'tuneClear'
         })
-    end, plate)
+    end, GetVehicleNumberPlateText(currentVeh))
     cb('ok')
 end)
 
--- Generate and push XML handling string to the NUI.
--- When called with vehicleData (from InsertXML / preset page), ALSO apply that
--- preset's handling to the vehicle — this is what makes presets actually work.
+-- Generate handling XML and, when called from InsertXML, apply the preset too
 RegisterNUICallback('GET_XML_DATA', function(data, cb)
     if not currentVeh or not DoesEntityExist(currentVeh) then cb('ok') return end
 
     local vehData
     if data and data.vehicleData then
-        -- data.vehicleData = selectedData = { name, vehicleData = {flat handling} }
-        -- flat handling lives one level deeper
+        -- InsertXML sends { vehicleData = selectedData } where
+        -- selectedData = { name, vehicleData = {flat handling} }
         vehData = data.vehicleData.vehicleData or data.vehicleData
-
-        -- Apply the preset to the vehicle right now
-        -- setAdvancedData(veh, { vehicleData={flat} }, false, false) is the correct call
-        -- data.vehicleData already has the right shape: { name, vehicleData={flat} }
+        -- Apply the preset — data.vehicleData has shape { name, vehicleData={flat} }
+        -- which is exactly what setAdvancedData(veh, x, false, false) expects
         setAdvancedData(currentVeh, data.vehicleData, false, false)
         ClientNotification(Locales.Default['ADVANCED_MODE_NOTIFY'], 'success')
     else
         vehData = GetVehData(currentVeh)
     end
 
-    SendNUIMessage({
-        message = 'GET_XML_DATA',
-        XMLData = GenerateHandlingXML(vehData)
-    })
+    SendNUIMessage({ message = 'GET_XML_DATA', XMLData = GenerateHandlingXML(vehData) })
     cb('ok')
 end)
 
 -- ==========================================
--- Server -> client events
+-- Server → client events
 -- ==========================================
 
--- Restore saved handling when entering a vehicle (triggered by server).
--- CurrentVehicleData is stored as { vehicleData = {flat handling} } by setAdvancedData,
--- so we must unwrap the inner flat table before passing to DefaultAdvancedData.
+-- Apply saved tuning when entering a vehicle.
+-- CurrentVehicleData is stored as { vehicleData = {flat} } by setAdvancedData.
 RegisterNetEvent('m-tuning:applyVehicleData', true)
 AddEventHandler('m-tuning:applyVehicleData', function(plate, data)
     local ped = PlayerPedId()
     local veh = GetVehiclePedIsIn(ped, false)
     if not DoesEntityExist(veh) then return end
     if GetVehicleNumberPlateText(veh) ~= plate then return end
-    -- Unwrap wrapper if present; DefaultAdvancedData expects a flat handling table
     local flatData = (data and data.vehicleData) and data.vehicleData or data
     DefaultAdvancedData(veh, plate, flatData)
 end)
 
 -- ==========================================
--- Vehicle entry monitor — applies saved tuning on enter
+-- Vehicle entry monitor
+-- Cache factory values BEFORE requesting saved tuning so
+-- GetFactory() always returns the original unmodified data.
 -- ==========================================
 CreateThread(function()
     local lastVeh = 0
@@ -423,12 +442,14 @@ CreateThread(function()
         if veh ~= 0 and veh ~= lastVeh then
             lastVeh    = veh
             currentVeh = veh
-            local plate = GetVehicleNumberPlateText(veh)
-            TriggerServerEvent('m-tuning:requestVehicleData', plate)
+            -- Read factory values NOW, before applyVehicleData arrives from server
+            vehicleFactory[veh] = GetVehData(veh)
+            TriggerServerEvent('m-tuning:requestVehicleData', GetVehicleNumberPlateText(veh))
 
         elseif veh == 0 and lastVeh ~= 0 then
-            lastVeh    = 0
-            currentVeh = nil
+            vehicleFactory[lastVeh] = nil   -- free memory when leaving vehicle
+            lastVeh     = 0
+            currentVeh  = nil
             isDriftMode = false
             isSportMode = false
         end
@@ -436,7 +457,7 @@ CreateThread(function()
 end)
 
 -- ==========================================
--- Drift mode speed enforcer
+-- Drift mode speed enforcer — reverts to factory if over the limit
 -- ==========================================
 if Config.DriftModeLimit then
     CreateThread(function()
@@ -445,11 +466,11 @@ if Config.DriftModeLimit then
             if isDriftMode and currentVeh and DoesEntityExist(currentVeh) then
                 local speed = GetEntitySpeed(currentVeh)
                 local displaySpeed = Config.MPH and (speed * 2.236936) or (speed * 3.6)
-
                 if displaySpeed > Config.MaxDriftSpeed then
                     isDriftMode = false
                     ClientNotification(Locales.Default['NORMAL_MODE_NOTIFY'], 'error')
-                    DefaultAdvancedData(currentVeh, GetVehicleNumberPlateText(currentVeh), nil)
+                    local f = GetFactory()
+                    setAdvancedData(currentVeh, { vehicleData = f }, false, false)
                 end
             end
         end
