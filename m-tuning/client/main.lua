@@ -236,6 +236,10 @@ end)
 RegisterNUICallback('SAVE_DATA', function(data, cb)
     if not currentVeh or not DoesEntityExist(currentVeh) then cb('ok') return end
     setVehData(currentVeh, data)
+    -- Snapshot full vehicle state after the 5 basic sliders are applied and persist it
+    local plate    = GetVehicleNumberPlateText(currentVeh)
+    local snapshot = GetVehData(currentVeh)
+    TriggerServerEvent('m-tuning:CreateTableData', plate, { vehicleData = snapshot }, 'CurrentVehicleData')
     ClientNotification(Locales.Default['ADVANCED_MODE_NOTIFY'], 'success')
     cb('ok')
 end)
@@ -253,8 +257,10 @@ RegisterNUICallback('SAVE_ADVANCED_DATA', function(data, cb)
     if not data.vehicleData or not data.DataName or data.DataName == '' then cb('ok') return end
 
     local plate = GetVehicleNumberPlateText(currentVeh)
+    -- Save flat vehicleData to preset DB row (InsertXML will re-wrap when applying)
     TriggerServerEvent('m-tuning:savePreset', plate, data.vehicleData, data.DataName)
-    setAdvancedData(currentVeh, data.vehicleData, false, false)
+    -- setAdvancedData expects { vehicleData = {flat handling} } as its data arg
+    setAdvancedData(currentVeh, { vehicleData = data.vehicleData }, false, false)
     ClientNotification(Locales.Default['ADVANCED_MODE_NOTIFY'], 'success')
     cb('ok')
 end)
@@ -299,26 +305,32 @@ RegisterNUICallback('CHANGE_MODE', function(data, cb)
 
         -- Drift: full rear-wheel bias, reduced traction, looser steering
         local d = GetVehData(currentVeh)
-        d.powerBiasValue       = 0.01          -- almost pure RWD
-        d.tireGripMaxValue     = d.tireGripMaxValue * 0.65
-        d.tireGripMinValue     = d.tireGripMinValue * 0.65
+        d.powerBiasValue       = 0.01
+        d.tireGripMaxValue     = d.tireGripMaxValue     * 0.65
+        d.tireGripMinValue     = d.tireGripMinValue     * 0.65
         d.offRoadTractionValue = d.offRoadTractionValue * 1.5
         d.lowSpeedBurnoutValue = 1.5
-        d.handBrakeStrength    = d.handBrakeStrength * 1.5
-        setAdvancedData(currentVeh, d, false, false)
+        d.handBrakeStrength    = d.handBrakeStrength    * 1.5
+        -- setAdvancedData expects { vehicleData = {flat handling} }
+        setAdvancedData(currentVeh, { vehicleData = d }, false, false)
         ClientNotification(Locales.Default['DRIFT_MODE_NOTIFY'], 'success')
 
     elseif mode == 'sportMode' then
         isDriftMode = false
         isSportMode = true
 
-        -- Sport: power/torque multipliers + tighter shift and higher top speed
+        -- Sport: boost drive force directly via handling floats (persists through engine events)
+        -- then also apply the engine multipliers on top for immediate feel
+        local d = GetVehData(currentVeh)
+        d.powerValue    = d.powerValue    * (Config.SportModeSettings['PowerMultiplier']  / 10.0)
+        d.topSpeedValue = d.topSpeedValue + Config.SportModeSettings['fInitialDriveMaxFlatVel']
+        d.driveInertiaValue = Config.SportModeSettings['fDriveInertia']
+        d.shiftUpValue   = Config.SportModeSettings['fClutchChangeRateScaleUpShift']
+        d.shiftDownValue = Config.SportModeSettings['fClutchChangeRateScaleDownShift']
+        setAdvancedData(currentVeh, { vehicleData = d }, false, false)
+        -- Multipliers stack on top of the handling floats for extra punch
         SetVehicleEnginePowerMultiplier(currentVeh, Config.SportModeSettings['PowerMultiplier'])
         SetVehicleEngineTorqueMultiplier(currentVeh, Config.SportModeSettings['TorqueMultiplier'])
-        SetVehicleHandlingFloat(currentVeh, 'CHandlingData', 'fInitialDriveMaxFlatVel',       Config.SportModeSettings['fInitialDriveMaxFlatVel'])
-        SetVehicleHandlingFloat(currentVeh, 'CHandlingData', 'fDriveInertia',                 Config.SportModeSettings['fDriveInertia'])
-        SetVehicleHandlingFloat(currentVeh, 'CHandlingData', 'fClutchChangeRateScaleUpShift',   Config.SportModeSettings['fClutchChangeRateScaleUpShift'])
-        SetVehicleHandlingFloat(currentVeh, 'CHandlingData', 'fClutchChangeRateScaleDownShift', Config.SportModeSettings['fClutchChangeRateScaleDownShift'])
         ClientNotification(Locales.Default['SPORT_MODE_NOTIFY'], 'success')
 
     elseif mode == 'normalMode' then
@@ -345,14 +357,23 @@ RegisterNUICallback('GET_VEHICLE_STATUS', function(_, cb)
     cb('ok')
 end)
 
--- Generate and push XML handling string to the NUI
+-- Generate and push XML handling string to the NUI.
+-- When called with vehicleData (from InsertXML / preset page), ALSO apply that
+-- preset's handling to the vehicle — this is what makes presets actually work.
 RegisterNUICallback('GET_XML_DATA', function(data, cb)
     if not currentVeh or not DoesEntityExist(currentVeh) then cb('ok') return end
 
     local vehData
     if data and data.vehicleData then
-        -- Called with a specific preset's data
+        -- data.vehicleData = selectedData = { name, vehicleData = {flat handling} }
+        -- flat handling lives one level deeper
         vehData = data.vehicleData.vehicleData or data.vehicleData
+
+        -- Apply the preset to the vehicle right now
+        -- setAdvancedData(veh, { vehicleData={flat} }, false, false) is the correct call
+        -- data.vehicleData already has the right shape: { name, vehicleData={flat} }
+        setAdvancedData(currentVeh, data.vehicleData, false, false)
+        ClientNotification(Locales.Default['ADVANCED_MODE_NOTIFY'], 'success')
     else
         vehData = GetVehData(currentVeh)
     end
@@ -368,14 +389,18 @@ end)
 -- Server -> client events
 -- ==========================================
 
--- Restore saved handling when entering a vehicle (triggered by server)
+-- Restore saved handling when entering a vehicle (triggered by server).
+-- CurrentVehicleData is stored as { vehicleData = {flat handling} } by setAdvancedData,
+-- so we must unwrap the inner flat table before passing to DefaultAdvancedData.
 RegisterNetEvent('m-tuning:applyVehicleData', true)
 AddEventHandler('m-tuning:applyVehicleData', function(plate, data)
     local ped = PlayerPedId()
     local veh = GetVehiclePedIsIn(ped, false)
     if not DoesEntityExist(veh) then return end
     if GetVehicleNumberPlateText(veh) ~= plate then return end
-    DefaultAdvancedData(veh, plate, data)
+    -- Unwrap wrapper if present; DefaultAdvancedData expects a flat handling table
+    local flatData = (data and data.vehicleData) and data.vehicleData or data
+    DefaultAdvancedData(veh, plate, flatData)
 end)
 
 -- ==========================================
