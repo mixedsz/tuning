@@ -232,11 +232,19 @@ RegisterNUICallback('CLOSE_TABLET', function(_, cb)
     cb('ok')
 end)
 
--- Basic tuning page sliders: boost, acceleration, gear change, brake bias, drivetrain
+-- Basic tuning page sliders: boost, acceleration, gear change, brake bias, drivetrain.
+-- Also scales top speed proportionally with the boost value so the car actually goes
+-- faster and doesn't just hit the same stock speed cap.
 RegisterNUICallback('SAVE_DATA', function(data, cb)
     if not currentVeh or not DoesEntityExist(currentVeh) then cb('ok') return end
     setVehData(currentVeh, data)
-    -- Snapshot full vehicle state after the 5 basic sliders are applied and persist it
+
+    -- Scale top speed with boost (boost 0→0.5 maps to 1.0→2.5× top speed)
+    local boostVal   = tonumber(data.boost) or 0.0
+    local stockSpeed = GetVehicleHandlingFloat(currentVeh, 'CHandlingData', 'fInitialDriveMaxFlatVel')
+    local speedMult  = 1.0 + (boostVal / 0.5) * 1.5   -- 0 boost = stock, 0.5 boost = 2.5×
+    SetVehicleHandlingFloat(currentVeh, 'CHandlingData', 'fInitialDriveMaxFlatVel', stockSpeed * speedMult)
+
     local plate    = GetVehicleNumberPlateText(currentVeh)
     local snapshot = GetVehData(currentVeh)
     TriggerServerEvent('m-tuning:CreateTableData', plate, { vehicleData = snapshot }, 'CurrentVehicleData')
@@ -299,41 +307,40 @@ RegisterNUICallback('CHANGE_MODE', function(data, cb)
     if not currentVeh or not DoesEntityExist(currentVeh) then cb('ok') return end
     local mode = data.mode
 
-    if mode == 'driftMode' then
+    -- Normalise mode string — HTML sends 'DriftMode'/'SportMode'/'NormalMode'
+    local modeLower = string.lower(mode)
+
+    if modeLower == 'driftmode' then
         isDriftMode = true
         isSportMode = false
 
-        -- Drift: full rear-wheel bias, reduced traction, looser steering
         local d = GetVehData(currentVeh)
-        d.powerBiasValue       = 0.01
+        d.powerBiasValue       = 0.01                        -- pure RWD
         d.tireGripMaxValue     = d.tireGripMaxValue     * 0.65
         d.tireGripMinValue     = d.tireGripMinValue     * 0.65
         d.offRoadTractionValue = d.offRoadTractionValue * 1.5
         d.lowSpeedBurnoutValue = 1.5
         d.handBrakeStrength    = d.handBrakeStrength    * 1.5
-        -- setAdvancedData expects { vehicleData = {flat handling} }
         setAdvancedData(currentVeh, { vehicleData = d }, false, false)
         ClientNotification(Locales.Default['DRIFT_MODE_NOTIFY'], 'success')
 
-    elseif mode == 'sportMode' then
+    elseif modeLower == 'sportmode' then
         isDriftMode = false
         isSportMode = true
 
-        -- Sport: boost drive force directly via handling floats (persists through engine events)
-        -- then also apply the engine multipliers on top for immediate feel
         local d = GetVehData(currentVeh)
-        d.powerValue    = d.powerValue    * (Config.SportModeSettings['PowerMultiplier']  / 10.0)
-        d.topSpeedValue = d.topSpeedValue + Config.SportModeSettings['fInitialDriveMaxFlatVel']
+        -- Multiply raw drive force by the power multiplier factor
+        d.powerValue        = d.powerValue * (Config.SportModeSettings['PowerMultiplier'] / 10.0)
+        d.topSpeedValue     = d.topSpeedValue + Config.SportModeSettings['fInitialDriveMaxFlatVel']
         d.driveInertiaValue = Config.SportModeSettings['fDriveInertia']
-        d.shiftUpValue   = Config.SportModeSettings['fClutchChangeRateScaleUpShift']
-        d.shiftDownValue = Config.SportModeSettings['fClutchChangeRateScaleDownShift']
+        d.shiftUpValue      = Config.SportModeSettings['fClutchChangeRateScaleUpShift']
+        d.shiftDownValue    = Config.SportModeSettings['fClutchChangeRateScaleDownShift']
         setAdvancedData(currentVeh, { vehicleData = d }, false, false)
-        -- Multipliers stack on top of the handling floats for extra punch
         SetVehicleEnginePowerMultiplier(currentVeh, Config.SportModeSettings['PowerMultiplier'])
         SetVehicleEngineTorqueMultiplier(currentVeh, Config.SportModeSettings['TorqueMultiplier'])
         ClientNotification(Locales.Default['SPORT_MODE_NOTIFY'], 'success')
 
-    elseif mode == 'normalMode' then
+    elseif modeLower == 'normalmode' then
         isDriftMode = false
         isSportMode = false
         DefaultAdvancedData(currentVeh, GetVehicleNumberPlateText(currentVeh), nil)
